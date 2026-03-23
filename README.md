@@ -1,104 +1,57 @@
-# Week 11: HAI Portfolio Dashboard
+"""
+utils.py — Utility functions for logging, formatting, etc.
+"""
 
-A governed prototype demonstrating Human-AI Interaction in financial products.
+import json
+import os
+from datetime import datetime
 
-## Quick Start
+LOG_DIR = os.path.join(os.path.dirname(__file__), "logs")
+LOG_FILE = os.path.join(LOG_DIR, "audit.jsonl")
 
-```bash
-# 1. Install dependencies
-pip install streamlit pandas plotly
 
-# 2. Run the app
-cd app
-python -m streamlit run app.py
-```
+def ensure_log_dir():
+    """Create logs/ directory if it doesn't exist."""
+    os.makedirs(LOG_DIR, exist_ok=True)
 
-The app will open at `http://localhost:8501`.
 
-## Passwords
+def append_log(record: dict):
+    """
+    Append a single JSON record to the audit log.
+    Uses JSONL format (one JSON object per line, append-only).
+    """
+    ensure_log_dir()
+    record["timestamp"] = datetime.now().isoformat(timespec="seconds")
+    with open(LOG_FILE, "a", encoding="utf-8") as f:
+        f.write(json.dumps(record, ensure_ascii=False) + "\n")
 
-| Role     | Password   | Can do                                    |
-|----------|------------|-------------------------------------------|
-| User     | `demo`     | View dashboard, ask assistant, export memo |
-| Reviewer | `reviewer` | All above + override + view full logs      |
 
-Passwords are in `.streamlit/secrets.toml` (not committed to git in real projects).
+def read_logs() -> list:
+    """Read all log records. Returns list of dicts."""
+    if not os.path.exists(LOG_FILE):
+        return []
+    records = []
+    with open(LOG_FILE, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                records.append(json.loads(line))
+    return records
 
-## Project Structure
 
-```
-app/
-├── app.py              # Streamlit main — tabs, UI, interactions
-├── logic.py            # Core logic — suitability, allocation, flags
-├── memo.py             # Memo generation (markdown)
-├── auth.py             # Password gate + role-based permissions
-├── utils.py            # Audit logging, formatting helpers
-├── sample_data.py      # 4 sample client profiles (A/B/C/D)
-├── .streamlit/
-│   └── secrets.toml    # Passwords (demo only)
-└── logs/
-    └── audit.jsonl     # Append-only audit log (auto-created)
-```
+def clear_logs():
+    """Clear the audit log file (for demo reset)."""
+    ensure_log_dir()
+    with open(LOG_FILE, "w") as f:
+        pass  # truncate
 
-## Architecture
 
-```
-Input Layer    →  sample_data.py (client profile)
-                      ↓
-Logic Layer    →  logic.py (suitability → bucket → allocation → flags)
-                      ↓
-HAI Layer      →  disclosure, confidence note, review trigger, override
-                      ↓
-Output Layer   →  dashboard | assistant | memo export | audit log
-```
+def format_pct(value: float) -> str:
+    """Format a float as percentage string."""
+    return f"{value:.1%}"
 
-## The Four Panels
 
-### 1. Dashboard
-- Risk score, bucket, horizon, uncertainty level
-- Pie chart (recommended allocation)
-- Grouped bar chart (current vs recommended)
-- Warning box (review flags)
-- Disclosure box (always visible)
-
-### 2. Assistant
-- Answers 4 fixed question types from rule-based logic
-- Responses change dynamically based on selected client
-- Not free-form LLM — fully traceable to score + rules
-
-### 3. Memo Export
-- Full markdown memo with profile, allocation, rationale, disclosure
-- Download as .md or .txt
-- Option to record export in audit log
-
-### 4. Review Log
-- Override form (reviewer role only)
-- Requires reason + adjusted weights
-- All actions logged to `logs/audit.jsonl`
-- Filter log by event type
-
-## Sample Clients
-
-| Client | Scenario | Expected Behavior |
-|--------|----------|-------------------|
-| A — Growth Investor | Normal case | Growth bucket, no flags |
-| B — Short Horizon | Boundary case | Suitability caps equity to 30%, flags triggered |
-| C — Goal Conflict | Conflict case | Score=82 but goal=preservation, flags triggered |
-| D — Conservative Retiree | Low risk | Conservative bucket, no flags |
-
-## HAI Checklist
-
-### A. Usability
-- [x] Recommendation clearly visible (pie chart + metrics)
-- [x] Rationale understandable (assistant panel)
-- [x] Next action clear (review status shown)
-- [x] Uncertainty visible (uncertainty level in dashboard)
-- [x] Interface not overconfident (disclosure always shown)
-
-### B. Risk Control
-- [x] Scope and limitations disclosed
-- [x] Review triggered for risky cases
-- [x] Outputs can be overridden (reviewer role)
-- [x] Overrides recorded with reason + timestamp
-- [x] Secrets handled safely (secrets.toml, not hardcoded)
-- [x] Basic access control (user vs reviewer roles)
+def format_weights_inline(weights: dict) -> str:
+    """Format weights dict as a single-line string."""
+    parts = [f"{k}: {v:.0%}" for k, v in weights.items()]
+    return " | ".join(parts)

@@ -1,314 +1,270 @@
 """
-requests.auth
-~~~~~~~~~~~~~
+logic.py — Core decision logic for the HAI Portfolio App.
 
-This module contains the authentication handlers for Requests.
+This module contains:
+  1. Suitability rules (pre-filter before allocation)
+  2. Risk bucket mapping (score -> bucket)
+  3. Base allocation templates (bucket -> weights)
+  4. Suitability cap enforcement (cap equity based on constraints)
+  5. Review flag detection (conflicting inputs -> escalation)
+  6. Explanation generation (state -> human-readable rationale)
+  7. Uncertainty classification
+
+All functions are pure: they take data in, return data out, no side effects.
+This makes them easy to test, audit, and reuse across UI / memo / log.
 """
 
-import hashlib
-import os
-import re
-import threading
-import time
-import warnings
-from base64 import b64encode
 
-from ._internal_utils import to_native_string
-from .compat import basestring, str, urlparse
-from .cookies import extract_cookies_to_jar
-from .utils import parse_dict_header
+# ── 1. Suitability rules ────────────────────────────────────
+def suitability_rules(client: dict) -> dict:
+    """
+    Determine constraints BEFORE allocation.
+    Returns a dict of caps and restrictions.
+    """
+    equity_cap = 0.90
+    cash_floor = 0.00
+    restricted = []
 
-CONTENT_TYPE_FORM_URLENCODED = "application/x-www-form-urlencoded"
-CONTENT_TYPE_MULTI_PART = "multipart/form-data"
+    # Short horizon -> hard cap on equity
+    if client["horizon_years"] <= 2:
+        equity_cap = min(equity_cap, 0.30)
+        cash_floor = max(cash_floor, 0.15)
+
+    # High liquidity need -> cap equity, raise cash floor
+    if client["liquidity_need"] == "high":
+        equity_cap = min(equity_cap, 0.40)
+        cash_floor = max(cash_floor, 0.10)
+
+    # Capital preservation goal -> tighter equity cap
+    if client["goal"] == "capital_preservation":
+        equity_cap = min(equity_cap, 0.35)
+
+    # Retirement income -> moderate cap
+    if client["goal"] == "retirement_income":
+        equity_cap = min(equity_cap, 0.50)
+
+    return {
+        "equity_cap": equity_cap,
+        "cash_floor": cash_floor,
+        "restricted": restricted,
+    }
 
 
-def _basic_auth_str(username, password):
-    """Returns a Basic Auth string."""
+# ── 2. Risk bucket ──────────────────────────────────────────
+def risk_bucket(score: float) -> str:
+    """Map a 0-100 risk score to a named bucket."""
+    if score < 25:
+        return "Very Conservative"
+    elif score < 45:
+        return "Conservative"
+    elif score < 60:
+        return "Balanced"
+    elif score < 75:
+        return "Growth"
+    else:
+        return "Aggressive"
 
-    # "I want us to put a big-ol' comment on top of it that
-    # says that this behaviour is dumb but we need to preserve
-    # it because people are relying on it."
-    #    - Lukasa
-    #
-    # These are here solely to maintain backwards compatibility
-    # for things like ints. This will be removed in 3.0.0.
-    if not isinstance(username, basestring):
-        warnings.warn(
-            "Non-string usernames will no longer be supported in Requests "
-            "3.0.0. Please convert the object you've passed in ({!r}) to "
-            "a string or bytes object in the near future to avoid "
-            "problems.".format(username),
-            category=DeprecationWarning,
+
+# ── 3. Base allocation templates ─────────────────────────────
+ALLOCATION_TEMPLATES = {
+    "Very Conservative": {"Equity": 0.15, "Bond": 0.60, "Gold": 0.10, "Cash": 0.15},
+    "Conservative":      {"Equity": 0.30, "Bond": 0.50, "Gold": 0.10, "Cash": 0.10},
+    "Balanced":          {"Equity": 0.50, "Bond": 0.35, "Gold": 0.10, "Cash": 0.05},
+    "Growth":            {"Equity": 0.70, "Bond": 0.20, "Gold": 0.05, "Cash": 0.05},
+    "Aggressive":        {"Equity": 0.85, "Bond": 0.10, "Gold": 0.05, "Cash": 0.00},
+}
+
+
+def base_allocation(bucket: str) -> dict:
+    """Return the template allocation for a given risk bucket."""
+    return ALLOCATION_TEMPLATES[bucket].copy()
+
+
+# ── 4. Apply suitability caps ────────────────────────────────
+def apply_caps(weights: dict, equity_cap: float, cash_floor: float = 0.0) -> dict:
+    """
+    Enforce suitability constraints on raw allocation weights.
+    If equity exceeds cap, redistribute excess to bond (70%) and cash (30%).
+    If cash is below floor, pull from other assets proportionally.
+    """
+    w = weights.copy()
+
+    # Enforce equity cap
+    if w["Equity"] > equity_cap:
+        excess = w["Equity"] - equity_cap
+        w["Equity"] = equity_cap
+        w["Bond"] += excess * 0.7
+        w["Cash"] += excess * 0.3
+
+    # Enforce cash floor
+    if w["Cash"] < cash_floor:
+        deficit = cash_floor - w["Cash"]
+        w["Cash"] = cash_floor
+        # Pull proportionally from equity and bond
+        eq_bond = w["Equity"] + w["Bond"]
+        if eq_bond > 0:
+            w["Equity"] -= deficit * (w["Equity"] / eq_bond)
+            w["Bond"] -= deficit * (w["Bond"] / eq_bond)
+
+    # Normalize to sum to 1
+    total = sum(w.values())
+    return {k: round(v / total, 4) for k, v in w.items()}
+
+
+# ── 5. Review flags ─────────────────────────────────────────
+def review_flags(client: dict, weights: dict) -> list:
+    """
+    Detect conditions that should trigger human review.
+    Returns a list of plain-English flag descriptions.
+    """
+    flags = []
+
+    # Short horizon but still high equity after caps
+    if client["horizon_years"] <= 2 and weights["Equity"] > 0.30:
+        flags.append(
+            "Short horizon with high equity recommendation"
         )
-        username = str(username)
 
-    if not isinstance(password, basestring):
-        warnings.warn(
-            "Non-string passwords will no longer be supported in Requests "
-            "3.0.0. Please convert the object you've passed in ({!r}) to "
-            "a string or bytes object in the near future to avoid "
-            "problems.".format(type(password)),
-            category=DeprecationWarning,
-        )
-        password = str(password)
-    # -- End Removal --
-
-    if isinstance(username, str):
-        username = username.encode("latin1")
-
-    if isinstance(password, str):
-        password = password.encode("latin1")
-
-    authstr = "Basic " + to_native_string(
-        b64encode(b":".join((username, password))).strip()
-    )
-
-    return authstr
-
-
-class AuthBase:
-    """Base class that all auth implementations derive from"""
-
-    def __call__(self, r):
-        raise NotImplementedError("Auth hooks must be callable.")
-
-
-class HTTPBasicAuth(AuthBase):
-    """Attaches HTTP Basic Authentication to the given Request object."""
-
-    def __init__(self, username, password):
-        self.username = username
-        self.password = password
-
-    def __eq__(self, other):
-        return all(
-            [
-                self.username == getattr(other, "username", None),
-                self.password == getattr(other, "password", None),
-            ]
+    # High liquidity need but low cash
+    if client["liquidity_need"] == "high" and weights["Cash"] < 0.15:
+        flags.append(
+            "High liquidity need but cash allocation may be insufficient"
         )
 
-    def __ne__(self, other):
-        return not self == other
-
-    def __call__(self, r):
-        r.headers["Authorization"] = _basic_auth_str(self.username, self.password)
-        return r
-
-
-class HTTPProxyAuth(HTTPBasicAuth):
-    """Attaches HTTP Proxy Authentication to a given Request object."""
-
-    def __call__(self, r):
-        r.headers["Proxy-Authorization"] = _basic_auth_str(self.username, self.password)
-        return r
-
-
-class HTTPDigestAuth(AuthBase):
-    """Attaches HTTP Digest Authentication to the given Request object."""
-
-    def __init__(self, username, password):
-        self.username = username
-        self.password = password
-        # Keep state in per-thread local storage
-        self._thread_local = threading.local()
-
-    def init_per_thread_state(self):
-        # Ensure state is initialized just once per-thread
-        if not hasattr(self._thread_local, "init"):
-            self._thread_local.init = True
-            self._thread_local.last_nonce = ""
-            self._thread_local.nonce_count = 0
-            self._thread_local.chal = {}
-            self._thread_local.pos = None
-            self._thread_local.num_401_calls = None
-
-    def build_digest_header(self, method, url):
-        """
-        :rtype: str
-        """
-
-        realm = self._thread_local.chal["realm"]
-        nonce = self._thread_local.chal["nonce"]
-        qop = self._thread_local.chal.get("qop")
-        algorithm = self._thread_local.chal.get("algorithm")
-        opaque = self._thread_local.chal.get("opaque")
-        hash_utf8 = None
-
-        if algorithm is None:
-            _algorithm = "MD5"
-        else:
-            _algorithm = algorithm.upper()
-        # lambdas assume digest modules are imported at the top level
-        if _algorithm == "MD5" or _algorithm == "MD5-SESS":
-
-            def md5_utf8(x):
-                if isinstance(x, str):
-                    x = x.encode("utf-8")
-                return hashlib.md5(x).hexdigest()
-
-            hash_utf8 = md5_utf8
-        elif _algorithm == "SHA":
-
-            def sha_utf8(x):
-                if isinstance(x, str):
-                    x = x.encode("utf-8")
-                return hashlib.sha1(x).hexdigest()
-
-            hash_utf8 = sha_utf8
-        elif _algorithm == "SHA-256":
-
-            def sha256_utf8(x):
-                if isinstance(x, str):
-                    x = x.encode("utf-8")
-                return hashlib.sha256(x).hexdigest()
-
-            hash_utf8 = sha256_utf8
-        elif _algorithm == "SHA-512":
-
-            def sha512_utf8(x):
-                if isinstance(x, str):
-                    x = x.encode("utf-8")
-                return hashlib.sha512(x).hexdigest()
-
-            hash_utf8 = sha512_utf8
-
-        KD = lambda s, d: hash_utf8(f"{s}:{d}")  # noqa:E731
-
-        if hash_utf8 is None:
-            return None
-
-        # XXX not implemented yet
-        entdig = None
-        p_parsed = urlparse(url)
-        #: path is request-uri defined in RFC 2616 which should not be empty
-        path = p_parsed.path or "/"
-        if p_parsed.query:
-            path += f"?{p_parsed.query}"
-
-        A1 = f"{self.username}:{realm}:{self.password}"
-        A2 = f"{method}:{path}"
-
-        HA1 = hash_utf8(A1)
-        HA2 = hash_utf8(A2)
-
-        if nonce == self._thread_local.last_nonce:
-            self._thread_local.nonce_count += 1
-        else:
-            self._thread_local.nonce_count = 1
-        ncvalue = f"{self._thread_local.nonce_count:08x}"
-        s = str(self._thread_local.nonce_count).encode("utf-8")
-        s += nonce.encode("utf-8")
-        s += time.ctime().encode("utf-8")
-        s += os.urandom(8)
-
-        cnonce = hashlib.sha1(s).hexdigest()[:16]
-        if _algorithm == "MD5-SESS":
-            HA1 = hash_utf8(f"{HA1}:{nonce}:{cnonce}")
-
-        if not qop:
-            respdig = KD(HA1, f"{nonce}:{HA2}")
-        elif qop == "auth" or "auth" in qop.split(","):
-            noncebit = f"{nonce}:{ncvalue}:{cnonce}:auth:{HA2}"
-            respdig = KD(HA1, noncebit)
-        else:
-            # XXX handle auth-int.
-            return None
-
-        self._thread_local.last_nonce = nonce
-
-        # XXX should the partial digests be encoded too?
-        base = (
-            f'username="{self.username}", realm="{realm}", nonce="{nonce}", '
-            f'uri="{path}", response="{respdig}"'
+    # Aggressive score conflicts with conservative goal
+    if client["risk_score_100"] >= 75 and client["goal"] == "capital_preservation":
+        flags.append(
+            "Aggressive risk score conflicts with capital preservation goal"
         )
-        if opaque:
-            base += f', opaque="{opaque}"'
-        if algorithm:
-            base += f', algorithm="{algorithm}"'
-        if entdig:
-            base += f', digest="{entdig}"'
-        if qop:
-            base += f', qop="auth", nc={ncvalue}, cnonce="{cnonce}"'
 
-        return f"Digest {base}"
+    # Very low experience / young with aggressive allocation
+    if client["age"] < 25 and weights["Equity"] > 0.70:
+        flags.append(
+            "Very young investor with high equity exposure — confirm experience"
+        )
 
-    def handle_redirect(self, r, **kwargs):
-        """Reset num_401_calls counter on redirects."""
-        if r.is_redirect:
-            self._thread_local.num_401_calls = 1
-
-    def handle_401(self, r, **kwargs):
-        """
-        Takes the given response and tries digest-auth, if needed.
-
-        :rtype: requests.Response
-        """
-
-        # If response is not 4xx, do not auth
-        # See https://github.com/psf/requests/issues/3772
-        if not 400 <= r.status_code < 500:
-            self._thread_local.num_401_calls = 1
-            return r
-
-        if self._thread_local.pos is not None:
-            # Rewind the file position indicator of the body to where
-            # it was to resend the request.
-            r.request.body.seek(self._thread_local.pos)
-        s_auth = r.headers.get("www-authenticate", "")
-
-        if "digest" in s_auth.lower() and self._thread_local.num_401_calls < 2:
-            self._thread_local.num_401_calls += 1
-            pat = re.compile(r"digest ", flags=re.IGNORECASE)
-            self._thread_local.chal = parse_dict_header(pat.sub("", s_auth, count=1))
-
-            # Consume content and release the original connection
-            # to allow our new request to reuse the same one.
-            r.content
-            r.close()
-            prep = r.request.copy()
-            extract_cookies_to_jar(prep._cookies, r.request, r.raw)
-            prep.prepare_cookies(prep._cookies)
-
-            prep.headers["Authorization"] = self.build_digest_header(
-                prep.method, prep.url
+    # Current holdings very different from recommendation
+    current = client.get("current_weights", {})
+    if current:
+        eq_diff = abs(current.get("Equity", 0) - weights["Equity"])
+        if eq_diff > 0.25:
+            flags.append(
+                f"Equity shift of {eq_diff:.0%} from current holdings — "
+                "large rebalancing required"
             )
-            _r = r.connection.send(prep, **kwargs)
-            _r.history.append(r)
-            _r.request = prep
 
-            return _r
+    return flags
 
-        self._thread_local.num_401_calls = 1
-        return r
 
-    def __call__(self, r):
-        # Initialize per-thread state, if needed
-        self.init_per_thread_state()
-        # If we have a saved nonce, skip the 401
-        if self._thread_local.last_nonce:
-            r.headers["Authorization"] = self.build_digest_header(r.method, r.url)
-        try:
-            self._thread_local.pos = r.body.tell()
-        except AttributeError:
-            # In the case of HTTPDigestAuth being reused and the body of
-            # the previous request was a file-like object, pos has the
-            # file position of the previous body. Ensure it's set to
-            # None.
-            self._thread_local.pos = None
-        r.register_hook("response", self.handle_401)
-        r.register_hook("response", self.handle_redirect)
-        self._thread_local.num_401_calls = 1
+# ── 6. Uncertainty level ─────────────────────────────────────
+def uncertainty_level(client: dict, flags: list) -> str:
+    """Classify output uncertainty as low / medium / high."""
+    if len(flags) >= 2:
+        return "high"
+    if len(flags) == 1:
+        return "medium"
+    if client["horizon_years"] <= 3:
+        return "medium"
+    return "low"
 
-        return r
 
-    def __eq__(self, other):
-        return all(
-            [
-                self.username == getattr(other, "username", None),
-                self.password == getattr(other, "password", None),
-            ]
+# ── 7. Explanation generator ─────────────────────────────────
+def build_explanation(client: dict, bucket: str, suit: dict,
+                      weights: dict, flags: list) -> str:
+    """
+    Produce a human-readable explanation of the recommendation.
+    This is used by the assistant panel and the memo.
+    """
+    w = weights
+    lines = [
+        f"Your risk score is {client['risk_score_100']}/100, "
+        f"placing you in the **{bucket}** bucket.",
+        "",
+        f"- Investment horizon: {client['horizon_years']} years",
+        f"- Liquidity need: {client['liquidity_need']}",
+        f"- Goal: {client['goal'].replace('_', ' ')}",
+        "",
+        f"Suitability constraints applied:",
+        f"- Equity cap: {suit['equity_cap']:.0%}",
+        f"- Cash floor: {suit['cash_floor']:.0%}",
+        "",
+        f"**Recommended allocation:**",
+        f"- Equity: {w['Equity']:.0%}",
+        f"- Bond: {w['Bond']:.0%}",
+        f"- Gold: {w['Gold']:.0%}",
+        f"- Cash: {w['Cash']:.0%}",
+    ]
+
+    if flags:
+        lines.append("")
+        lines.append("⚠️ **Review flags:**")
+        for f in flags:
+            lines.append(f"- {f}")
+
+    return "\n".join(lines)
+
+
+# ── 8. Risk description ─────────────────────────────────────
+def build_risk_description(client: dict, weights: dict,
+                           flags: list, unc: str) -> str:
+    """Describe the main risks for the assistant panel."""
+    lines = [
+        f"**Uncertainty level: {unc.upper()}**",
+        "",
+        "Key risks for this recommendation:",
+        "",
+        "1. **Market drawdown** — equity allocation of "
+        f"{weights['Equity']:.0%} means the portfolio could "
+        "decline significantly in a downturn.",
+        "",
+        "2. **Risk tolerance mismatch** — the stated risk score "
+        f"({client['risk_score_100']}) may not reflect actual "
+        "behavior during market stress.",
+        "",
+        "3. **Assumption risk** — expected returns and correlations "
+        "are based on historical data and may not hold in future regimes.",
+    ]
+
+    if client["horizon_years"] <= 3:
+        lines.append("")
+        lines.append(
+            "4. **Short horizon risk** — with only "
+            f"{client['horizon_years']} year(s), there is limited "
+            "time to recover from adverse market movements."
         )
 
-    def __ne__(self, other):
-        return not self == other
+    if flags:
+        lines.append("")
+        lines.append("Additional concerns flagged by the system:")
+        for f in flags:
+            lines.append(f"- {f}")
+
+    return "\n".join(lines)
+
+
+# ── 9. Pipeline: run everything ──────────────────────────────
+def run_pipeline(client: dict) -> dict:
+    """
+    Execute the full recommendation pipeline for a client.
+    Returns a dict with all computed state.
+    """
+    bucket = risk_bucket(client["risk_score_100"])
+    suit = suitability_rules(client)
+    raw_weights = base_allocation(bucket)
+    weights = apply_caps(raw_weights, suit["equity_cap"], suit["cash_floor"])
+    flags = review_flags(client, weights)
+    unc = uncertainty_level(client, flags)
+    explanation = build_explanation(client, bucket, suit, weights, flags)
+    risk_desc = build_risk_description(client, weights, flags, unc)
+
+    return {
+        "bucket": bucket,
+        "suit": suit,
+        "raw_weights": raw_weights,
+        "weights": weights,
+        "flags": flags,
+        "uncertainty": unc,
+        "explanation": explanation,
+        "risk_description": risk_desc,
+        "review_required": len(flags) > 0,
+    }
